@@ -1,0 +1,12 @@
+# Ambientes virtuais e dependências
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Arquivos de ambiente
+.env
+
+# Arquivos do PyCharm e Mac
+.idea/
+.DS_Store
