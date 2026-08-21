@@ -39,6 +39,13 @@ async def connect_to_db() -> None:
             max_size=settings.db_pool_max_size,
             command_timeout=settings.db_command_timeout,
             timeout=settings.db_connect_timeout,
+            # Obrigatório com o pooler do Supabase (pgbouncer em transaction
+            # pooling na porta 6543) — sem isso o asyncpg tenta cachear
+            # prepared statements por conexão, e como o pgbouncer troca a
+            # conexão real por baixo dos panos, duas sessões diferentes
+            # colidem no mesmo nome de statement. Custo: perde reuso de plano
+            # de query no servidor, aceitável pro tamanho de pool que temos.
+            statement_cache_size=0,
             # TODO: setar ssl="require" quando migrarmos pra produção
             # (RDS/Supabase/Neon geralmente exigem TLS na conexão)
         )
