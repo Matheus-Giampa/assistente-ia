@@ -1,4 +1,9 @@
 import logging
+
+import asyncio
+
+import bcrypt
+
 from datetime import datetime, timedelta, timezone
 
 from config import get_settings
@@ -60,3 +65,61 @@ async def is_account_locked(email: str) -> bool:
             email,
         )
     return locked_until is not None and locked_until > datetime.now(timezone.utc)
+
+async def hash_password(password: str) -> str:
+    """Hash de senha rodando bcrypt fora da event loop.
+
+    bcrypt é deliberadamente lento (isso que dificulta brute-force), mas
+    ~100-300ms bloqueando a thread principal do asyncio travaria TODA
+    requisição concorrente no servidor. to_thread joga pra uma threadpool
+    e mantém o loop livre enquanto isso.
+    """
+    def _hash() -> str:
+        return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+    return await asyncio.to_thread(_hash)
+
+
+async def verify_password(password: str, password_hash: str) -> bool:
+    def _verify() -> bool:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+
+    return await asyncio.to_thread(_verify)
+
+
+class InvalidCredentialsError(Exception):
+    """Email ou senha errados — mensagem genérica de propósito."""
+
+
+class AccountLockedError(Exception):
+    """Conta travada por excesso de tentativas falhas."""
+
+
+async def authenticate(email: str, password: str) -> None:
+    """Orquestra o login inteiro: lock check -> busca usuário -> valida senha.
+
+    Nunca revela se foi o email que não existe ou a senha que está errada
+    — as duas situações levantam o mesmo InvalidCredentialsError. Isso evita
+    dar munição pra quem estiver testando quais emails têm conta (user
+    enumeration).
+    """
+    if await is_account_locked(email):
+        raise AccountLockedError("Conta temporariamente bloqueada")
+
+    async with acquire_connection() as conn:
+        row = await conn.fetchrow(
+            "SELECT password_hash FROM users WHERE email = $1", email
+        )
+
+    if row is None:
+        # TODO: considerar comparar contra um hash fixo/dummy aqui pra igualar
+        # o tempo de resposta entre "email não existe" e "senha errada" —
+        # hoje esse caminho é mais rápido por pular o bcrypt, o que em teoria
+        # dá pra medir por timing attack. Baixa prioridade pro estágio atual.
+        raise InvalidCredentialsError("Email ou senha inválidos")
+
+    if not await verify_password(password, row["password_hash"]):
+        await register_failed_attempt(email)
+        raise InvalidCredentialsError("Email ou senha inválidos")
+
+    await reset_failed_attempts(email)
