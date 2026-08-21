@@ -1,10 +1,17 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 
-from auth import AccountLockedError, InvalidCredentialsError, authenticate, create_access_token
+from auth import (
+    AccountLockedError,
+    InvalidCredentialsError,
+    authenticate,
+    create_access_token,
+    get_current_user,
+)
+
 from database import DatabaseUnavailableError, close_db_connection, connect_to_db
 
 
@@ -55,3 +62,8 @@ async def login(payload: LoginRequest):
 
     access_token = create_access_token(user_id)
     return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.get("/me")
+async def me(user_id: str = Depends(get_current_user)):
+    return {"user_id": user_id}

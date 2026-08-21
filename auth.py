@@ -1,7 +1,8 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import bcrypt
 import jwt
 
@@ -158,3 +159,22 @@ def decode_access_token(token: str) -> str:
     except jwt.PyJWTError:
         raise InvalidTokenError("Token inválido ou expirado") from None
     return payload["sub"]
+
+security = HTTPBearer()
+
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+    """Dependency pra proteger rota: `Depends(get_current_user)` no parametro da rota.
+
+    Le o header "Authorization: Bearer <token>", valida e devolve o user_id.
+    Se faltar o header ou o token for invalido/expirado, corta com 401 antes
+    de qualquer linha de codigo da rota rodar.
+    """
+    try:
+        return decode_access_token(credentials.credentials)
+    except InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token invalido ou expirado",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
