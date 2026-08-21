@@ -47,10 +47,3 @@
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 1.25rem;
 }
-
-.dashboard__debug {
-  margin-top: 2rem;
-  text-align: center;
-  color: #737373;
-  font-size: 0.85rem;
-}

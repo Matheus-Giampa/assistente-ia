@@ -1,0 +1,140 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+
+type ConnectionStatus = "idle" | "connecting" | "open" | "closed" | "error";
+
+// Formatos exigidos pelo Gemini Live -- ver live_session.py no backend.
+const INPUT_SAMPLE_RATE = 16000;
+const OUTPUT_SAMPLE_RATE = 24000;
+
+function floatToInt16(input: Float32Array): Int16Array {
+  const output = new Int16Array(input.length);
+  for (let i = 0; i < input.length; i++) {
+    const s = Math.max(-1, Math.min(1, input[i]));
+    output[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return output;
+}
+
+function int16ToFloat(input: Int16Array): Float32Array {
+  const output = new Float32Array(input.length);
+  for (let i = 0; i < input.length; i++) {
+    output[i] = input[i] / 0x8000;
+  }
+  return output;
+}
+
+export function useAudioSession(missionId: string, token: string) {
+  const [status, setStatus] = useState<ConnectionStatus>("idle");
+  const [muted, setMuted] = useState(false);
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const inputContextRef = useRef<AudioContext | null>(null);
+  const outputContextRef = useRef<AudioContext | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const mutedRef = useRef(false);
+  const playbackTimeRef = useRef(0);
+
+  useEffect(() => {
+    mutedRef.current = muted;
+  }, [muted]);
+
+  const stop = useCallback(() => {
+    wsRef.current?.close();
+    wsRef.current = null;
+
+    processorRef.current?.disconnect();
+    processorRef.current = null;
+
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+
+    void inputContextRef.current?.close();
+    inputContextRef.current = null;
+
+    void outputContextRef.current?.close();
+    outputContextRef.current = null;
+
+    setStatus("closed");
+  }, []);
+
+  const start = useCallback(async () => {
+    setStatus("connecting");
+
+    const apiUrl = import.meta.env.VITE_API_URL as string;
+    const wsUrl = apiUrl.replace(/^http/, "ws");
+    const ws = new WebSocket(`${wsUrl}/ws/session/${missionId}?token=${token}`);
+    ws.binaryType = "arraybuffer";
+    wsRef.current = ws;
+
+    const outputContext = new AudioContext({ sampleRate: OUTPUT_SAMPLE_RATE });
+    outputContextRef.current = outputContext;
+    playbackTimeRef.current = outputContext.currentTime;
+
+    ws.onopen = async () => {
+      setStatus("open");
+
+      // TODO: Defesa Nivel 1 (Mute Inteligente) ja fica pronta aqui de graca
+      // -- o mutedRef.current dentro do onaudioprocess corta o envio de
+      // chunk sem fechar o WebSocket, exatamente como o briefing pede.
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        streamRef.current = stream;
+
+        const inputContext = new AudioContext({ sampleRate: INPUT_SAMPLE_RATE });
+        inputContextRef.current = inputContext;
+
+        const source = inputContext.createMediaStreamSource(stream);
+        // ScriptProcessorNode esta deprecated em favor de AudioWorklet, mas
+        // funciona em todo navegador atual e evita precisar servir um arquivo
+        // de worklet separado. TODO: migrar pra AudioWorklet quando sobrar
+        // tempo pra polir performance (roda fora da main thread).
+        const processor = inputContext.createScriptProcessor(4096, 1, 1);
+        processorRef.current = processor;
+
+        processor.onaudioprocess = (event) => {
+          if (mutedRef.current || ws.readyState !== WebSocket.OPEN) return;
+          const input = event.inputBuffer.getChannelData(0);
+          const pcm = floatToInt16(input);
+          ws.send(pcm.buffer);
+        };
+
+        source.connect(processor);
+        processor.connect(inputContext.destination);
+      } catch {
+        // Sem acesso ao microfone (permissao negada, sem dispositivo, etc)
+        // a sessao nao serve pra nada -- encerra e mostra erro em vez de
+        // ficar preso mostrando "Ouvindo..." sem nunca capturar audio.
+        setStatus("error");
+        ws.close();
+      }
+    };
+
+    ws.onmessage = (event) => {
+      const context = outputContextRef.current;
+      if (!context || !(event.data instanceof ArrayBuffer)) return;
+
+      const float32 = int16ToFloat(new Int16Array(event.data));
+      const buffer = context.createBuffer(1, float32.length, OUTPUT_SAMPLE_RATE);
+      buffer.copyToChannel(float32, 0);
+
+      const bufferSource = context.createBufferSource();
+      bufferSource.buffer = buffer;
+      bufferSource.connect(context.destination);
+
+      // Agenda cada pedaco de audio pra tocar em sequencia, sem sobrepor
+      // nem deixar buraco de silencio entre eles.
+      const now = context.currentTime;
+      const startAt = Math.max(now, playbackTimeRef.current);
+      bufferSource.start(startAt);
+      playbackTimeRef.current = startAt + buffer.duration;
+    };
+
+    ws.onerror = () => setStatus("error");
+    ws.onclose = () => setStatus((current) => (current === "error" ? current : "closed"));
+  }, [missionId, token]);
+
+  useEffect(() => stop, [stop]);
+
+  return { status, muted, setMuted, start, stop };
+}

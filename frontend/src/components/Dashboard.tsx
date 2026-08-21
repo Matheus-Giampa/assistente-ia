@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { fetchMissions, ApiError } from "../api/client";
 import type { Mission } from "../types/mission";
 import { MissionCard } from "./MissionCard";
+import { Session } from "./Session";
 import { useAuth } from "../context/AuthContext";
 import "./Dashboard.css";
 
@@ -27,6 +28,10 @@ export function Dashboard() {
       .finally(() => setLoading(false));
   }, [token, logout]);
 
+  if (selected) {
+    return <Session mission={selected} onEnd={() => setSelected(null)} />;
+  }
+
   return (
     <div className="dashboard">
       <header className="dashboard__header">
@@ -45,12 +50,6 @@ export function Dashboard() {
           <MissionCard key={mission.id} mission={mission} onSelect={setSelected} />
         ))}
       </div>
-
-      {selected && (
-        <p className="dashboard__debug">
-          Selecionado: {selected.title} (conexão com o Gemini Live ainda não existe)
-        </p>
-      )}
     </div>
   );
 }

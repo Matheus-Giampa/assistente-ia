@@ -130,6 +130,7 @@ async def audio_session(websocket: WebSocket, mission_id: str) -> None:
     finally:
         try:
             await websocket.close()
-        except RuntimeError:
-            # ja fechado por um dos dois lados, tudo bem
+        except (RuntimeError, WebSocketDisconnect):
+            # ja fechado por um dos dois lados (cliente caiu, rede, etc) --
+            # tentar fechar de novo so pra confirmar nao eh erro de verdade.
             pass
