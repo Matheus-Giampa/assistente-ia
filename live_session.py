@@ -21,7 +21,14 @@ MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 _client = genai.Client(api_key=settings.gemini_api_key)
 
 
-async def run_audio_bridge(websocket: WebSocket, system_prompt: str) -> None:
+RESUME_PROMPT = (
+    "A conversa caiu por um problema tecnico do lado do servidor. Retome de onde "
+    "estava, cumprimente brevemente o usuario avisando que voltou e pergunte se "
+    "pode continuar -- sem repetir tudo que ja foi dito antes."
+)
+
+
+async def run_audio_bridge(websocket: WebSocket, system_prompt: str, resume: bool = False) -> None:
     """Abre a sessao com o Gemini Live e faz a ponte de audio nos dois
     sentidos ate qualquer um dos lados (cliente ou Gemini) encerrar.
 
@@ -35,6 +42,12 @@ async def run_audio_bridge(websocket: WebSocket, system_prompt: str) -> None:
     fala por cima do Gemini (precisa parar e limpar o que ja tava tocando,
     senao vira audio picado de turnos sobrepostos) e "go_away" quando o
     Gemini avisa que vai derrubar a conexao em breve.
+
+    resume=True quando o frontend reconectou sozinho apos detectar que a
+    sessao anterior travou (Gemini parou de responder, mas a conexao TCP
+    nao caiu) -- ver "Recuperacao de Contexto (Cheap Prompting)" no
+    briefing original. Manda um prompt de texto barato pra reavivar a
+    conversa em vez de reprocessar todo audio antigo.
     """
     config = {
         "response_modalities": ["AUDIO"],
@@ -42,6 +55,11 @@ async def run_audio_bridge(websocket: WebSocket, system_prompt: str) -> None:
     }
 
     async with _client.aio.live.connect(model=MODEL, config=config) as session:
+        if resume:
+            await session.send_client_content(
+                turns={"role": "user", "parts": [{"text": RESUME_PROMPT}]},
+                turn_complete=True,
+            )
 
         async def client_to_gemini() -> None:
             while True:
@@ -51,26 +69,42 @@ async def run_audio_bridge(websocket: WebSocket, system_prompt: str) -> None:
                 )
 
         async def gemini_to_client() -> None:
-            async for response in session.receive():
-                if response.go_away:
-                    logger.info("Gemini avisou go_away: time_left=%s", response.go_away.time_left)
-                    await websocket.send_text(json.dumps({
-                        "type": "go_away",
-                        "time_left": response.go_away.time_left,
-                    }))
+            # session.receive() e um generator POR TURNO -- ele termina
+            # sozinho (sem exception) quando aquele turno acaba
+            # (turnComplete=True), nao quando a sessao inteira acaba.
+            # Por isso o loop externo: cada vez que um turno termina,
+            # chama session.receive() de novo pra continuar ouvindo o
+            # proximo turno da conversa.
+            while True:
+                async for response in session.receive():
+                    if response.go_away:
+                        logger.info("Gemini avisou go_away: time_left=%s", response.go_away.time_left)
+                        await websocket.send_text(json.dumps({
+                            "type": "go_away",
+                            "time_left": response.go_away.time_left,
+                        }))
 
-                if not response.server_content:
-                    continue
+                    if not response.server_content:
+                        continue
 
-                if response.server_content.interrupted:
-                    await websocket.send_text(json.dumps({"type": "interrupted"}))
+                    if response.server_content.interrupted:
+                        await websocket.send_text(json.dumps({"type": "interrupted"}))
 
-                if not response.server_content.model_turn:
-                    continue
+                    if response.server_content.model_turn:
+                        for part in response.server_content.model_turn.parts:
+                            if part.inline_data:
+                                await websocket.send_bytes(part.inline_data.data)
 
-                for part in response.server_content.model_turn.parts:
-                    if part.inline_data:
-                        await websocket.send_bytes(part.inline_data.data)
+                    if response.server_content.turn_complete:
+                        # Manda por ultimo, sempre depois do audio -- se
+                        # audio e turn_complete vierem juntos na mesma
+                        # resposta, o cliente precisa ver o audio primeiro
+                        # e "turn_complete" como a palavra final, senao a
+                        # flag de "IA falando" do frontend fica travada em
+                        # true pra sempre (audio chegando depois do aviso
+                        # reativa ela sem ter mais nenhum turn_complete
+                        # posterior pra desligar de novo).
+                        await websocket.send_text(json.dumps({"type": "turn_complete"}))
 
         tasks = [
             asyncio.create_task(client_to_gemini()),
@@ -82,6 +116,8 @@ async def run_audio_bridge(websocket: WebSocket, system_prompt: str) -> None:
                 task.cancel()
             for task in done:
                 exc = task.exception()
+                if exc:
+                    logger.info("Task %s terminou com exception: %r", task.get_coro(), exc)
                 if exc and not isinstance(exc, WebSocketDisconnect):
                     raise exc
         finally:

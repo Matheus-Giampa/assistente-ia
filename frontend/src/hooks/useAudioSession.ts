@@ -24,14 +24,19 @@ function int16ToFloat(input: Int16Array): Float32Array {
 }
 
 interface ControlMessage {
-  type: "interrupted" | "go_away";
+  type: "interrupted" | "go_away" | "turn_complete";
   time_left?: string;
 }
+
+// Quanto tempo sem NENHUMA resposta do Gemini (audio ou sinal de controle)
+// depois do usuario falar pra considerar que ele travou/parou de responder.
+const NO_RESPONSE_TIMEOUT_MS = 20000;
 
 export function useAudioSession(missionId: string, token: string) {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [muted, setMuted] = useState(false);
   const [goAwayWarning, setGoAwayWarning] = useState<string | null>(null);
+  const [noResponse, setNoResponse] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const inputContextRef = useRef<AudioContext | null>(null);
@@ -41,6 +46,46 @@ export function useAudioSession(missionId: string, token: string) {
   const mutedRef = useRef(false);
   const playbackTimeRef = useRef(0);
   const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  // True enquanto o Gemini esta com a vez de falar -- pausa o envio do
+  // microfone nesse intervalo pra evitar auto-interrupcao por eco/ruido
+  // (era a causa do audio picotado). Vira false de novo no "turn_complete".
+  const isAiSpeakingRef = useRef(false);
+  // Watchdog: se nao chegar audio novo nem turn_complete por um tempo,
+  // destrava o microfone sozinho. Rede de seguranca contra qualquer bug
+  // futuro que deixe isAiSpeakingRef preso em true pra sempre (ja aconteceu
+  // uma vez por causa de mensagem com audio + turn_complete juntos).
+  const speakingWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function armSpeakingWatchdog() {
+    if (speakingWatchdogRef.current) clearTimeout(speakingWatchdogRef.current);
+    speakingWatchdogRef.current = setTimeout(() => {
+      isAiSpeakingRef.current = false;
+    }, 3000);
+  }
+
+  // Detecta o Gemini "travando" (conexao continua aberta, mas ele para de
+  // responder de vez) -- visto acontecer de verdade em sessao longa com
+  // modelo preview. Rearmado a cada chunk de audio que o usuario manda;
+  // se estourar sem nenhuma resposta chegar antes, avisa na tela em vez
+  // de deixar o usuario falando sem retorno nenhum.
+  const noResponseTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Indirecao pra chamar o reconnect() de dentro do watchdog sem depender
+  // de ordem de declaracao (reconnect() usa start/stop, definidos abaixo).
+  const reconnectRef = useRef<() => void>(() => {});
+
+  function armNoResponseWatchdog() {
+    if (noResponseTimeoutRef.current) clearTimeout(noResponseTimeoutRef.current);
+    noResponseTimeoutRef.current = setTimeout(() => {
+      setNoResponse(true);
+      reconnectRef.current();
+    }, NO_RESPONSE_TIMEOUT_MS);
+  }
+
+  function clearNoResponseWatchdog() {
+    if (noResponseTimeoutRef.current) clearTimeout(noResponseTimeoutRef.current);
+    setNoResponse(false);
+  }
 
   useEffect(() => {
     mutedRef.current = muted;
@@ -63,15 +108,20 @@ export function useAudioSession(missionId: string, token: string) {
     outputContextRef.current = null;
 
     activeSourcesRef.current = [];
+    isAiSpeakingRef.current = false;
+    if (speakingWatchdogRef.current) clearTimeout(speakingWatchdogRef.current);
+    if (noResponseTimeoutRef.current) clearTimeout(noResponseTimeoutRef.current);
+    setNoResponse(false);
     setStatus("closed");
   }, []);
 
-  const start = useCallback(async () => {
+  const start = useCallback(async (resume = false) => {
     setStatus("connecting");
 
     const apiUrl = import.meta.env.VITE_API_URL as string;
     const wsUrl = apiUrl.replace(/^http/, "ws");
-    const ws = new WebSocket(`${wsUrl}/ws/session/${missionId}?token=${token}`);
+    const resumeParam = resume ? "&resume=true" : "";
+    const ws = new WebSocket(`${wsUrl}/ws/session/${missionId}?token=${token}${resumeParam}`);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
@@ -86,7 +136,13 @@ export function useAudioSession(missionId: string, token: string) {
       // -- o mutedRef.current dentro do onaudioprocess corta o envio de
       // chunk sem fechar o WebSocket, exatamente como o briefing pede.
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            noiseSuppression: true,
+            echoCancellation: true,
+            autoGainControl: true,
+          },
+        });
         streamRef.current = stream;
 
         const inputContext = new AudioContext({ sampleRate: INPUT_SAMPLE_RATE });
@@ -101,10 +157,11 @@ export function useAudioSession(missionId: string, token: string) {
         processorRef.current = processor;
 
         processor.onaudioprocess = (event) => {
-          if (mutedRef.current || ws.readyState !== WebSocket.OPEN) return;
+          if (mutedRef.current || isAiSpeakingRef.current || ws.readyState !== WebSocket.OPEN) return;
           const input = event.inputBuffer.getChannelData(0);
           const pcm = floatToInt16(input);
           ws.send(pcm.buffer);
+          armNoResponseWatchdog();
         };
 
         source.connect(processor);
@@ -121,6 +178,10 @@ export function useAudioSession(missionId: string, token: string) {
     ws.onmessage = (event) => {
       const context = outputContextRef.current;
       if (!context) return;
+
+      // Qualquer coisa vinda do Gemini (audio ou controle) prova que ele
+      // ainda esta vivo e respondendo -- desarma o alerta de "travou".
+      clearNoResponseWatchdog();
 
       if (typeof event.data === "string") {
         const message = JSON.parse(event.data) as ControlMessage;
@@ -139,6 +200,14 @@ export function useAudioSession(missionId: string, token: string) {
           }
           activeSourcesRef.current = [];
           playbackTimeRef.current = context.currentTime;
+          isAiSpeakingRef.current = false;
+          if (speakingWatchdogRef.current) clearTimeout(speakingWatchdogRef.current);
+        }
+
+        if (message.type === "turn_complete") {
+          // A vez do Gemini acabou -- libera o microfone de novo.
+          isAiSpeakingRef.current = false;
+          if (speakingWatchdogRef.current) clearTimeout(speakingWatchdogRef.current);
         }
 
         if (message.type === "go_away") {
@@ -149,6 +218,11 @@ export function useAudioSession(missionId: string, token: string) {
       }
 
       if (!(event.data instanceof ArrayBuffer)) return;
+
+      // Chegou audio novo do Gemini -- ele esta com a vez de falar, entao
+      // pausa o envio do microfone ate o turn_complete.
+      isAiSpeakingRef.current = true;
+      armSpeakingWatchdog();
 
       const float32 = int16ToFloat(new Int16Array(event.data));
       const buffer = context.createBuffer(1, float32.length, OUTPUT_SAMPLE_RATE);
@@ -170,11 +244,30 @@ export function useAudioSession(missionId: string, token: string) {
       playbackTimeRef.current = startAt + buffer.duration;
     };
 
-    ws.onerror = () => setStatus("error");
-    ws.onclose = () => setStatus((current) => (current === "error" ? current : "closed"));
+    ws.onerror = () => {
+      if (wsRef.current !== ws) return; // conexao antiga, ja substituida por um reconnect
+      setStatus("error");
+    };
+    ws.onclose = () => {
+      if (wsRef.current !== ws) return; // conexao antiga, ja substituida por um reconnect
+      setStatus((current) => (current === "error" ? current : "closed"));
+    };
   }, [missionId, token]);
+
+  // Reconexao automatica quando o watchdog de "travou" estoura: fecha a
+  // sessao morta e abre uma nova com resume=true, que injeta o prompt
+  // barato de retomada em vez de reprocessar o audio todo (Cheap Prompting
+  // do briefing original).
+  const reconnect = useCallback(() => {
+    stop();
+    void start(true);
+  }, [stop, start]);
+
+  useEffect(() => {
+    reconnectRef.current = reconnect;
+  }, [reconnect]);
 
   useEffect(() => stop, [stop]);
 
-  return { status, muted, setMuted, start, stop, goAwayWarning };
+  return { status, muted, setMuted, start, stop, goAwayWarning, noResponse };
 }

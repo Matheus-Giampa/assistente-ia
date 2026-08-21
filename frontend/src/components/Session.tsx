@@ -11,7 +11,7 @@ interface SessionProps {
 
 export function Session({ mission, onEnd }: SessionProps) {
   const { token } = useAuth();
-  const { status, muted, setMuted, start, stop, goAwayWarning } = useAudioSession(
+  const { status, muted, setMuted, start, stop, goAwayWarning, noResponse } = useAudioSession(
     mission.id,
     token ?? "",
   );
@@ -49,6 +49,12 @@ export function Session({ mission, onEnd }: SessionProps) {
         <p className="session__warning">
           A sessão vai encerrar em breve ({goAwayWarning}) — o Gemini avisou antes de derrubar a
           conexão.
+        </p>
+      )}
+
+      {noResponse && (
+        <p className="session__warning">
+          A IA parou de responder — reconectando automaticamente e retomando a conversa...
         </p>
       )}
 
