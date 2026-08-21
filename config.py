@@ -27,3 +27,7 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     # lru_cache garante que o .env só é parseado uma vez por processo
     return Settings()
+    # JWT (stateless — sem tabela de sessão, só assinatura + expiração)
+    jwt_secret_key: str
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 60
