@@ -5,8 +5,32 @@
 }
 
 .dashboard__header {
+  position: relative;
   text-align: center;
   margin-bottom: 2.5rem;
+}
+
+.dashboard__logout {
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 0.4rem 0.9rem;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: transparent;
+  color: #d4d4d4;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.dashboard__status {
+  text-align: center;
+  color: #a3a3a3;
+  margin-bottom: 1.5rem;
+}
+
+.dashboard__status--error {
+  color: #f87171;
 }
 
 .dashboard__header h1 {

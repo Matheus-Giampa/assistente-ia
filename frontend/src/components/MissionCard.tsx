@@ -11,7 +11,7 @@ export function MissionCard({ mission, onSelect }: MissionCardProps) {
   return (
     <button
       className="mission-card"
-      style={{ "--accent-color": mission.accentColor } as CSSProperties}
+      style={{ "--accent-color": mission.accent_color } as CSSProperties}
       onClick={() => onSelect(mission)}
     >
       <span className="mission-card__emoji">{mission.emoji}</span>

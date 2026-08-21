@@ -6,5 +6,5 @@ export interface Mission {
   title: string;
   description: string;
   emoji: string;
-  accentColor: string;
+  accent_color: string;
 }

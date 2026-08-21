@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 
@@ -13,6 +14,7 @@ from auth import (
 )
 
 from database import DatabaseUnavailableError, close_db_connection, connect_to_db
+from missions import list_missions
 
 
 @asynccontextmanager
@@ -25,6 +27,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="API Vozes", version="0.1.0", lifespan=lifespan)
+
+# TODO: acrescentar aqui o dominio do frontend em producao quando ele for
+# publicado (ex: https://app.assistente-ia.duckdns.org). Por enquanto so
+# libera o dev server local do Vite.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.exception_handler(DatabaseUnavailableError)
@@ -67,3 +80,19 @@ async def login(payload: LoginRequest):
 @app.get("/me")
 async def me(user_id: str = Depends(get_current_user)):
     return {"user_id": user_id}
+
+
+class MissionOut(BaseModel):
+    id: str
+    mode: str
+    title: str
+    description: str
+    emoji: str
+    accent_color: str
+
+
+@app.get("/missions", response_model=list[MissionOut])
+async def get_missions(user_id: str = Depends(get_current_user)):
+    # "Zero ping anonimo" -- ate a lista de missoes exige token valido,
+    # nao tem endpoint publico nessa API.
+    return await list_missions()
