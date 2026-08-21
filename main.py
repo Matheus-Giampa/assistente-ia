@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
@@ -8,13 +8,16 @@ from pydantic import BaseModel, EmailStr
 from auth import (
     AccountLockedError,
     InvalidCredentialsError,
+    InvalidTokenError,
     authenticate,
     create_access_token,
+    decode_access_token,
     get_current_user,
 )
 
 from database import DatabaseUnavailableError, close_db_connection, connect_to_db
-from missions import list_missions
+from live_session import run_audio_bridge
+from missions import get_mission_system_prompt, list_missions
 
 
 @asynccontextmanager
@@ -96,3 +99,37 @@ async def get_missions(user_id: str = Depends(get_current_user)):
     # "Zero ping anonimo" -- ate a lista de missoes exige token valido,
     # nao tem endpoint publico nessa API.
     return await list_missions()
+
+
+@app.websocket("/ws/session/{mission_id}")
+async def audio_session(websocket: WebSocket, mission_id: str) -> None:
+    # WebSocket nativo do navegador nao manda header Authorization -- o
+    # token vem via query string mesmo (ws://.../ws/session/x?token=...).
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=4401)
+        return
+
+    try:
+        decode_access_token(token)
+    except InvalidTokenError:
+        await websocket.close(code=4401)
+        return
+
+    system_prompt = await get_mission_system_prompt(mission_id)
+    if system_prompt is None:
+        await websocket.close(code=4404)
+        return
+
+    await websocket.accept()
+
+    try:
+        await run_audio_bridge(websocket, system_prompt)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        try:
+            await websocket.close()
+        except RuntimeError:
+            # ja fechado por um dos dois lados, tudo bem
+            pass
