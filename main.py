@@ -8,10 +8,11 @@ from pydantic import BaseModel, EmailStr
 from auth import (
     AccountLockedError,
     InvalidCredentialsError,
-    InvalidTokenError,
     authenticate,
+    check_ip_rate_limit,
+    consume_ws_ticket,
     create_access_token,
-    decode_access_token,
+    create_ws_ticket,
     get_current_user,
 )
 
@@ -69,7 +70,14 @@ class LoginRequest(BaseModel):
 
 
 @app.post("/login")
-async def login(payload: LoginRequest):
+async def login(payload: LoginRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_ip_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Muitas tentativas, tente novamente mais tarde",
+        )
+
     try:
         user_id = await authenticate(payload.email, payload.password)
     except AccountLockedError:
@@ -108,18 +116,20 @@ async def get_missions(user_id: str = Depends(get_current_user)):
     return await list_missions()
 
 
+@app.post("/ws-ticket")
+async def get_ws_ticket(user_id: str = Depends(get_current_user)):
+    # Ticket de uso unico e vida curta (30s) pra autenticar o WebSocket de
+    # audio sem mandar o JWT de sessao na URL -- ver auth.py, create_ws_ticket.
+    return {"ticket": create_ws_ticket(user_id)}
+
+
 @app.websocket("/ws/session/{mission_id}")
 async def audio_session(websocket: WebSocket, mission_id: str) -> None:
-    # WebSocket nativo do navegador nao manda header Authorization -- o
-    # token vem via query string mesmo (ws://.../ws/session/x?token=...).
-    token = websocket.query_params.get("token")
-    if not token:
-        await websocket.close(code=4401)
-        return
-
-    try:
-        decode_access_token(token)
-    except InvalidTokenError:
+    # WebSocket nativo do navegador nao manda header Authorization -- por
+    # isso o ticket descartavel (nao o JWT de sessao) vem via query string
+    # (ws://.../ws/session/x?ticket=...).
+    ticket = websocket.query_params.get("ticket")
+    if not ticket or consume_ws_ticket(ticket) is None:
         await websocket.close(code=4401)
         return
 

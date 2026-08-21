@@ -43,3 +43,15 @@ export function fetchMissions<T>(token: string): Promise<T> {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
+
+interface WsTicketResponse {
+  ticket: string;
+}
+
+export async function createWsTicket(token: string): Promise<string> {
+  const { ticket } = await request<WsTicketResponse>("/ws-ticket", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return ticket;
+}

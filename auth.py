@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -12,6 +14,13 @@ from database import acquire_connection
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
+
+# Hash fixo (nunca usado como senha de verdade por ninguem) so pra ter algo
+# valido pra comparar quando o email nao existe -- ver authenticate() abaixo,
+# isso equaliza o tempo de resposta entre "email nao existe" e "senha errada"
+# (achado real de pentest: sem isso da pra medir ~1s de diferenca e descobrir
+# quais emails tem conta so cronometrando a resposta).
+_DUMMY_PASSWORD_HASH = bcrypt.hashpw(b"dummy-password-nao-e-credencial-real", bcrypt.gensalt()).decode("utf-8")
 
 
 async def register_failed_attempt(email: str) -> None:
@@ -117,10 +126,9 @@ async def authenticate(email: str, password: str) -> str:
         )
 
     if row is None:
-        # TODO: considerar comparar contra um hash fixo/dummy aqui pra igualar
-        # o tempo de resposta entre "email não existe" e "senha errada" —
-        # hoje esse caminho é mais rápido por pular o bcrypt, o que em teoria
-        # dá pra medir por timing attack. Baixa prioridade pro estágio atual.
+        # Roda o bcrypt mesmo sem usuario pra gastar o mesmo tempo do
+        # caminho onde o usuario existe -- ver _DUMMY_PASSWORD_HASH.
+        await verify_password(password, _DUMMY_PASSWORD_HASH)
         raise InvalidCredentialsError("Email ou senha inválidos")
 
     if not await verify_password(password, row["password_hash"]):
@@ -178,3 +186,64 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             detail="Token invalido ou expirado",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+# --- Rate limit por IP no /login -----------------------------------------
+# O lockout por conta (register_failed_attempt) protege UMA conta especifica,
+# mas nao impede um atacante de tentar milhares de emails diferentes sem
+# limite. Isso complementa com um teto por IP, independente de qual conta
+# esta sendo tentada. Em memoria mesmo (janela fixa) -- app roda num
+# processo uvicorn so, nao precisa de Redis pra esse volume.
+_login_attempts_by_ip: dict[str, list[float]] = {}
+LOGIN_RATE_LIMIT_MAX = 20
+LOGIN_RATE_LIMIT_WINDOW_SECONDS = 300.0
+
+
+def check_ip_rate_limit(ip: str) -> bool:
+    """True se o IP ainda esta dentro do limite (e ja registra essa
+    tentativa). False se estourou -- quem chamar deve cortar com 429."""
+    now = time.monotonic()
+    window_start = now - LOGIN_RATE_LIMIT_WINDOW_SECONDS
+    attempts = [t for t in _login_attempts_by_ip.get(ip, []) if t > window_start]
+    attempts.append(now)
+    _login_attempts_by_ip[ip] = attempts
+    return len(attempts) <= LOGIN_RATE_LIMIT_MAX
+
+
+# --- Tickets de uso unico pro WebSocket -----------------------------------
+# WebSocket nativo do navegador nao manda header Authorization, entao o
+# jeito padrao e mandar credencial na query string -- mas isso fica gravado
+# em texto puro no log de acesso do Nginx. Em vez de mandar o JWT de sessao
+# (que vive 60min) na URL, o cliente pede um ticket aleatorio e descartavel
+# (30s, uso unico) por uma chamada HTTP normal com o header Authorization de
+# verdade, e usa esse ticket na URL do WebSocket. Mesmo vazando no log, o
+# ticket expira rapido e ja foi consumido na primeira conexao.
+_ws_tickets: dict[str, tuple[str, float]] = {}
+WS_TICKET_TTL_SECONDS = 30.0
+
+
+def _prune_expired_tickets() -> None:
+    now = time.monotonic()
+    expired = [t for t, (_, exp) in _ws_tickets.items() if exp < now]
+    for t in expired:
+        del _ws_tickets[t]
+
+
+def create_ws_ticket(user_id: str) -> str:
+    _prune_expired_tickets()
+    ticket = secrets.token_urlsafe(32)
+    _ws_tickets[ticket] = (user_id, time.monotonic() + WS_TICKET_TTL_SECONDS)
+    return ticket
+
+
+def consume_ws_ticket(ticket: str) -> str | None:
+    """Valida e ja consome o ticket (remove da memoria na primeira leitura,
+    valido ou nao -- uso unico de verdade). None se invalido/expirado."""
+    _prune_expired_tickets()
+    entry = _ws_tickets.pop(ticket, None)
+    if entry is None:
+        return None
+    user_id, expires_at = entry
+    if expires_at < time.monotonic():
+        return None
+    return user_id

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { createWsTicket } from "../api/client";
 
 type ConnectionStatus = "idle" | "connecting" | "open" | "closed" | "error";
 
@@ -129,10 +130,20 @@ export function useAudioSession(missionId: string, token: string) {
   const start = useCallback(async (resume = false) => {
     setStatus("connecting");
 
+    // Ticket descartavel (30s, uso unico) em vez do JWT de sessao direto na
+    // URL do WebSocket -- token de sessao nunca aparece em log de acesso.
+    let ticket: string;
+    try {
+      ticket = await createWsTicket(token);
+    } catch {
+      setStatus("error");
+      return;
+    }
+
     const apiUrl = import.meta.env.VITE_API_URL as string;
     const wsUrl = resolveWsUrl(apiUrl);
     const resumeParam = resume ? "&resume=true" : "";
-    const ws = new WebSocket(`${wsUrl}/ws/session/${missionId}?token=${token}${resumeParam}`);
+    const ws = new WebSocket(`${wsUrl}/ws/session/${missionId}?ticket=${ticket}${resumeParam}`);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
