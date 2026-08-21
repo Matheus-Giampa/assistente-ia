@@ -153,6 +153,7 @@ export function useAudioSession(missionId: string, token: string) {
 
     ws.onopen = async () => {
       setStatus("open");
+      armNoResponseWatchdog();
 
       // TODO: Defesa Nivel 1 (Mute Inteligente) ja fica pronta aqui de graca
       // -- o mutedRef.current dentro do onaudioprocess corta o envio de
@@ -183,7 +184,14 @@ export function useAudioSession(missionId: string, token: string) {
           const input = event.inputBuffer.getChannelData(0);
           const pcm = floatToInt16(input);
           ws.send(pcm.buffer as ArrayBuffer);
-          armNoResponseWatchdog();
+          // NAO rearma o watchdog aqui -- isso e chamado a cada ~250ms
+          // enquanto o usuario fala, e rearmar em todo chunk fazia o timer
+          // de 20s nunca completar enquanto a pessoa continuasse falando
+          // esperando resposta (bug real, achado com HAR: 112s de silencio
+          // do Gemini e o watchdog nunca disparou). Agora so arma quando um
+          // turno termina (ver "turn_complete"/"interrupted" abaixo) e no
+          // ws.onopen -- representa "tempo desde a ultima resposta", nao
+          // "tempo desde o ultimo audio enviado".
         };
 
         source.connect(processor);
@@ -224,12 +232,15 @@ export function useAudioSession(missionId: string, token: string) {
           playbackTimeRef.current = context.currentTime;
           isAiSpeakingRef.current = false;
           if (speakingWatchdogRef.current) clearTimeout(speakingWatchdogRef.current);
+          armNoResponseWatchdog();
         }
 
         if (message.type === "turn_complete") {
-          // A vez do Gemini acabou -- libera o microfone de novo.
+          // A vez do Gemini acabou -- libera o microfone de novo e comeca a
+          // contar os 20s de espera pela PROXIMA resposta.
           isAiSpeakingRef.current = false;
           if (speakingWatchdogRef.current) clearTimeout(speakingWatchdogRef.current);
+          armNoResponseWatchdog();
         }
 
         if (message.type === "go_away") {
