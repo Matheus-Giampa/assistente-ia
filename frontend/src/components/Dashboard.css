@@ -1,0 +1,32 @@
+.dashboard {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 3rem 1.5rem;
+}
+
+.dashboard__header {
+  text-align: center;
+  margin-bottom: 2.5rem;
+}
+
+.dashboard__header h1 {
+  font-size: 2rem;
+  margin-bottom: 0.5rem;
+}
+
+.dashboard__header p {
+  color: #a3a3a3;
+}
+
+.dashboard__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1.25rem;
+}
+
+.dashboard__debug {
+  margin-top: 2rem;
+  text-align: center;
+  color: #737373;
+  font-size: 0.85rem;
+}

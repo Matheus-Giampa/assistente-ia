@@ -10,3 +10,10 @@ __pycache__/
 # Arquivos do PyCharm e Mac
 .idea/
 .DS_Store
+
+# Config local de ferramentas (preview de navegador, etc) — nunca vai pro repo
+.claude/
+
+# Frontend (Node/Vite)
+frontend/node_modules/
+frontend/dist/
