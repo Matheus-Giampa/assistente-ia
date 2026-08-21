@@ -6,6 +6,17 @@ type ConnectionStatus = "idle" | "connecting" | "open" | "closed" | "error";
 const INPUT_SAMPLE_RATE = 16000;
 const OUTPUT_SAMPLE_RATE = 24000;
 
+// Em dev, VITE_API_URL e absoluta (http://localhost:8000). Em producao e
+// relativa (/api), porque frontend e backend ficam no mesmo dominio atras
+// do Nginx -- nesse caso monta o ws:// a partir da origem atual da pagina.
+function resolveWsUrl(apiUrl: string): string {
+  if (/^https?:\/\//.test(apiUrl)) {
+    return apiUrl.replace(/^http/, "ws");
+  }
+  const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${scheme}://${window.location.host}${apiUrl}`;
+}
+
 function floatToInt16(input: Float32Array): Int16Array {
   const output = new Int16Array(input.length);
   for (let i = 0; i < input.length; i++) {
@@ -119,7 +130,7 @@ export function useAudioSession(missionId: string, token: string) {
     setStatus("connecting");
 
     const apiUrl = import.meta.env.VITE_API_URL as string;
-    const wsUrl = apiUrl.replace(/^http/, "ws");
+    const wsUrl = resolveWsUrl(apiUrl);
     const resumeParam = resume ? "&resume=true" : "";
     const ws = new WebSocket(`${wsUrl}/ws/session/${missionId}?token=${token}${resumeParam}`);
     ws.binaryType = "arraybuffer";
@@ -160,7 +171,7 @@ export function useAudioSession(missionId: string, token: string) {
           if (mutedRef.current || isAiSpeakingRef.current || ws.readyState !== WebSocket.OPEN) return;
           const input = event.inputBuffer.getChannelData(0);
           const pcm = floatToInt16(input);
-          ws.send(pcm.buffer);
+          ws.send(pcm.buffer as ArrayBuffer);
           armNoResponseWatchdog();
         };
 
@@ -226,7 +237,7 @@ export function useAudioSession(missionId: string, token: string) {
 
       const float32 = int16ToFloat(new Int16Array(event.data));
       const buffer = context.createBuffer(1, float32.length, OUTPUT_SAMPLE_RATE);
-      buffer.copyToChannel(float32, 0);
+      buffer.copyToChannel(float32 as Float32Array<ArrayBuffer>, 0);
 
       const bufferSource = context.createBufferSource();
       bufferSource.buffer = buffer;
