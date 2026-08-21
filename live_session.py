@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -11,9 +12,11 @@ logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
+# Gemini 2.5 Flash com audio nativo (nao half-cascade) -- trocado de
+# proposito pra usar a chave com cota maior.
 # TODO: revisitar esse nome quando o Gemini Live sair de preview -- modelos
 # preview mudam de nome/fica deprecado sem muito aviso previo.
-MODEL = "gemini-3.1-flash-live-preview"
+MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 
 _client = genai.Client(api_key=settings.gemini_api_key)
 
@@ -26,6 +29,12 @@ async def run_audio_bridge(websocket: WebSocket, system_prompt: str) -> None:
     pro Gemini, outra le a resposta do Gemini e manda de volta pro cliente.
     Quando uma termina (por desconexao, por exemplo), cancela a outra --
     nao faz sentido continuar bombeando audio pra um lado morto.
+
+    Alem do audio bruto (mensagens binarias), manda mensagens de texto JSON
+    como sinal de controle pro cliente -- "interrupted" quando o usuario
+    fala por cima do Gemini (precisa parar e limpar o que ja tava tocando,
+    senao vira audio picado de turnos sobrepostos) e "go_away" quando o
+    Gemini avisa que vai derrubar a conexao em breve.
     """
     config = {
         "response_modalities": ["AUDIO"],
@@ -43,8 +52,22 @@ async def run_audio_bridge(websocket: WebSocket, system_prompt: str) -> None:
 
         async def gemini_to_client() -> None:
             async for response in session.receive():
-                if not response.server_content or not response.server_content.model_turn:
+                if response.go_away:
+                    logger.info("Gemini avisou go_away: time_left=%s", response.go_away.time_left)
+                    await websocket.send_text(json.dumps({
+                        "type": "go_away",
+                        "time_left": response.go_away.time_left,
+                    }))
+
+                if not response.server_content:
                     continue
+
+                if response.server_content.interrupted:
+                    await websocket.send_text(json.dumps({"type": "interrupted"}))
+
+                if not response.server_content.model_turn:
+                    continue
+
                 for part in response.server_content.model_turn.parts:
                     if part.inline_data:
                         await websocket.send_bytes(part.inline_data.data)

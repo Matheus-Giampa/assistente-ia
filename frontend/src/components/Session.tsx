@@ -11,7 +11,10 @@ interface SessionProps {
 
 export function Session({ mission, onEnd }: SessionProps) {
   const { token } = useAuth();
-  const { status, muted, setMuted, start, stop } = useAudioSession(mission.id, token ?? "");
+  const { status, muted, setMuted, start, stop, goAwayWarning } = useAudioSession(
+    mission.id,
+    token ?? "",
+  );
 
   useEffect(() => {
     void start();
@@ -41,6 +44,13 @@ export function Session({ mission, onEnd }: SessionProps) {
         {status === "error" && "Erro: verifique a permissão do microfone ou a conexão"}
         {status === "closed" && "Sessão encerrada"}
       </p>
+
+      {goAwayWarning && (
+        <p className="session__warning">
+          A sessão vai encerrar em breve ({goAwayWarning}) — o Gemini avisou antes de derrubar a
+          conexão.
+        </p>
+      )}
 
       <div className="session__controls">
         <button

@@ -23,9 +23,15 @@ function int16ToFloat(input: Int16Array): Float32Array {
   return output;
 }
 
+interface ControlMessage {
+  type: "interrupted" | "go_away";
+  time_left?: string;
+}
+
 export function useAudioSession(missionId: string, token: string) {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [muted, setMuted] = useState(false);
+  const [goAwayWarning, setGoAwayWarning] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const inputContextRef = useRef<AudioContext | null>(null);
@@ -34,6 +40,7 @@ export function useAudioSession(missionId: string, token: string) {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const mutedRef = useRef(false);
   const playbackTimeRef = useRef(0);
+  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
 
   useEffect(() => {
     mutedRef.current = muted;
@@ -55,6 +62,7 @@ export function useAudioSession(missionId: string, token: string) {
     void outputContextRef.current?.close();
     outputContextRef.current = null;
 
+    activeSourcesRef.current = [];
     setStatus("closed");
   }, []);
 
@@ -112,7 +120,35 @@ export function useAudioSession(missionId: string, token: string) {
 
     ws.onmessage = (event) => {
       const context = outputContextRef.current;
-      if (!context || !(event.data instanceof ArrayBuffer)) return;
+      if (!context) return;
+
+      if (typeof event.data === "string") {
+        const message = JSON.parse(event.data) as ControlMessage;
+
+        if (message.type === "interrupted") {
+          // Usuario comecou a falar por cima do Gemini -- para tudo que
+          // ja estava agendado pra tocar e esvazia a fila, senao o audio
+          // do turno interrompido continua saindo picado por cima do
+          // audio do turno novo.
+          for (const source of activeSourcesRef.current) {
+            try {
+              source.stop();
+            } catch {
+              // ja tinha terminado de tocar sozinho, tudo bem
+            }
+          }
+          activeSourcesRef.current = [];
+          playbackTimeRef.current = context.currentTime;
+        }
+
+        if (message.type === "go_away") {
+          setGoAwayWarning(message.time_left ?? "em breve");
+        }
+
+        return;
+      }
+
+      if (!(event.data instanceof ArrayBuffer)) return;
 
       const float32 = int16ToFloat(new Int16Array(event.data));
       const buffer = context.createBuffer(1, float32.length, OUTPUT_SAMPLE_RATE);
@@ -121,6 +157,10 @@ export function useAudioSession(missionId: string, token: string) {
       const bufferSource = context.createBufferSource();
       bufferSource.buffer = buffer;
       bufferSource.connect(context.destination);
+      bufferSource.onended = () => {
+        activeSourcesRef.current = activeSourcesRef.current.filter((s) => s !== bufferSource);
+      };
+      activeSourcesRef.current.push(bufferSource);
 
       // Agenda cada pedaco de audio pra tocar em sequencia, sem sobrepor
       // nem deixar buraco de silencio entre eles.
@@ -136,5 +176,5 @@ export function useAudioSession(missionId: string, token: string) {
 
   useEffect(() => stop, [stop]);
 
-  return { status, muted, setMuted, start, stop };
+  return { status, muted, setMuted, start, stop, goAwayWarning };
 }
