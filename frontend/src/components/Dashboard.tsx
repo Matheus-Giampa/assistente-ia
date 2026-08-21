@@ -3,6 +3,7 @@ import { fetchMissions, ApiError } from "../api/client";
 import type { Mission } from "../types/mission";
 import { MissionCard } from "./MissionCard";
 import { Session } from "./Session";
+import { LoginLog } from "./LoginLog";
 import { useAuth } from "../context/AuthContext";
 import "./Dashboard.css";
 
@@ -10,6 +11,7 @@ export function Dashboard() {
   const { token, logout } = useAuth();
   const [missions, setMissions] = useState<Mission[]>([]);
   const [selected, setSelected] = useState<Mission | null>(null);
+  const [showLog, setShowLog] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -32,9 +34,16 @@ export function Dashboard() {
     return <Session mission={selected} onEnd={() => setSelected(null)} />;
   }
 
+  if (showLog) {
+    return <LoginLog onBack={() => setShowLog(false)} />;
+  }
+
   return (
     <div className="dashboard">
       <header className="dashboard__header">
+        <button className="dashboard__log-link" onClick={() => setShowLog(true)}>
+          Logs
+        </button>
         <button className="dashboard__logout" onClick={logout}>
           Sair
         </button>

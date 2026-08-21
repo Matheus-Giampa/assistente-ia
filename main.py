@@ -14,6 +14,7 @@ from auth import (
     create_access_token,
     create_ws_ticket,
     get_current_user,
+    list_login_events,
 )
 
 from database import DatabaseUnavailableError, close_db_connection, connect_to_db
@@ -79,7 +80,7 @@ async def login(payload: LoginRequest, request: Request):
         )
 
     try:
-        user_id = await authenticate(payload.email, payload.password)
+        user_id = await authenticate(payload.email, payload.password, ip_address=client_ip)
     except AccountLockedError:
         raise HTTPException(
             status_code=status.HTTP_423_LOCKED,
@@ -98,6 +99,24 @@ async def login(payload: LoginRequest, request: Request):
 @app.get("/me")
 async def me(user_id: str = Depends(get_current_user)):
     return {"user_id": user_id}
+
+
+class LoginEventOut(BaseModel):
+    email: str
+    success: bool
+    ip_address: str | None
+    created_at: str
+
+
+@app.get("/login-events", response_model=list[LoginEventOut])
+async def get_login_events(user_id: str = Depends(get_current_user)):
+    # Painel de auditoria -- qualquer usuario logado ve o historico global
+    # de tentativas de login (app pequeno, sem conceito de admin ainda).
+    events = await list_login_events()
+    return [
+        {**e, "created_at": e["created_at"].isoformat()}
+        for e in events
+    ]
 
 
 class MissionOut(BaseModel):

@@ -1,0 +1,77 @@
+.login-log {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 3rem 1.5rem;
+}
+
+.login-log__header {
+  position: relative;
+  text-align: center;
+  margin-bottom: 2rem;
+}
+
+.login-log__back {
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 0.4rem 0.9rem;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: transparent;
+  color: #d4d4d4;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.login-log__header h1 {
+  font-size: 1.5rem;
+  margin-bottom: 0.25rem;
+}
+
+.login-log__header p {
+  color: #a3a3a3;
+  font-size: 0.9rem;
+}
+
+.login-log__status {
+  text-align: center;
+  color: #a3a3a3;
+}
+
+.login-log__status--error {
+  color: #f87171;
+}
+
+.login-log__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.login-log__table th,
+.login-log__table td {
+  text-align: left;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.login-log__table th {
+  color: #a3a3a3;
+  font-weight: 600;
+}
+
+.login-log__badge {
+  padding: 0.15rem 0.5rem;
+  border-radius: 6px;
+  font-size: 0.75rem;
+}
+
+.login-log__badge--ok {
+  background: rgba(16, 185, 129, 0.15);
+  color: #10b981;
+}
+
+.login-log__badge--fail {
+  background: rgba(248, 113, 113, 0.15);
+  color: #f87171;
+}

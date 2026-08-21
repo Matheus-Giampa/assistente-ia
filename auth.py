@@ -106,7 +106,29 @@ class AccountLockedError(Exception):
     """Conta travada por excesso de tentativas falhas."""
 
 
-async def authenticate(email: str, password: str) -> str:
+async def log_login_event(email: str, success: bool, ip_address: str | None) -> None:
+    """Auditoria de login -- toda tentativa (sucesso ou falha) fica
+    registrada com email, IP e horario. Painel de consulta em GET /login-events.
+    """
+    async with acquire_connection() as conn:
+        await conn.execute(
+            "INSERT INTO login_events (email, success, ip_address) VALUES ($1, $2, $3)",
+            email, success, ip_address,
+        )
+
+
+async def list_login_events(limit: int = 100) -> list[dict]:
+    """Ultimas tentativas de login, mais recentes primeiro."""
+    async with acquire_connection() as conn:
+        rows = await conn.fetch(
+            "SELECT email, success, ip_address, created_at FROM login_events "
+            "ORDER BY created_at DESC LIMIT $1",
+            limit,
+        )
+    return [dict(row) for row in rows]
+
+
+async def authenticate(email: str, password: str, ip_address: str | None = None) -> str:
     """Orquestra o login inteiro: lock check -> busca usuário -> valida senha.
 
     Nunca revela se foi o email que não existe ou a senha que está errada
@@ -118,6 +140,7 @@ async def authenticate(email: str, password: str) -> str:
     token de acesso.
     """
     if await is_account_locked(email):
+        await log_login_event(email, success=False, ip_address=ip_address)
         raise AccountLockedError("Conta temporariamente bloqueada")
 
     async with acquire_connection() as conn:
@@ -129,13 +152,16 @@ async def authenticate(email: str, password: str) -> str:
         # Roda o bcrypt mesmo sem usuario pra gastar o mesmo tempo do
         # caminho onde o usuario existe -- ver _DUMMY_PASSWORD_HASH.
         await verify_password(password, _DUMMY_PASSWORD_HASH)
+        await log_login_event(email, success=False, ip_address=ip_address)
         raise InvalidCredentialsError("Email ou senha inválidos")
 
     if not await verify_password(password, row["password_hash"]):
         await register_failed_attempt(email)
+        await log_login_event(email, success=False, ip_address=ip_address)
         raise InvalidCredentialsError("Email ou senha inválidos")
 
     await reset_failed_attempts(email)
+    await log_login_event(email, success=True, ip_address=ip_address)
     return str(row["id"])
 
 

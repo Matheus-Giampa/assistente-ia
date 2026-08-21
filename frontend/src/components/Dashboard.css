@@ -10,10 +10,10 @@
   margin-bottom: 2.5rem;
 }
 
-.dashboard__logout {
+.dashboard__logout,
+.dashboard__log-link {
   position: absolute;
   top: 0;
-  right: 0;
   padding: 0.4rem 0.9rem;
   border-radius: 8px;
   border: 1px solid rgba(255, 255, 255, 0.15);
@@ -21,6 +21,14 @@
   color: #d4d4d4;
   font-size: 0.85rem;
   cursor: pointer;
+}
+
+.dashboard__logout {
+  right: 0;
+}
+
+.dashboard__log-link {
+  right: 5.5rem;
 }
 
 .dashboard__status {

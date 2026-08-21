@@ -55,3 +55,16 @@ export async function createWsTicket(token: string): Promise<string> {
   });
   return ticket;
 }
+
+export interface LoginEvent {
+  email: string;
+  success: boolean;
+  ip_address: string | null;
+  created_at: string;
+}
+
+export function fetchLoginEvents(token: string): Promise<LoginEvent[]> {
+  return request<LoginEvent[]>("/login-events", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
