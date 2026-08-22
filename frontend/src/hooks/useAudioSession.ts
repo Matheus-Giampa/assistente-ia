@@ -44,11 +44,33 @@ interface ControlMessage {
 // depois do usuario falar pra considerar que ele travou/parou de responder.
 const NO_RESPONSE_TIMEOUT_MS = 20000;
 
+// Defesa Nivel 2: quanto tempo sem VOZ DETECTADA no microfone (usuario
+// sumiu/deixou a aba aberta) antes de derrubar a sessao Gemini Live sozinha
+// -- ela fica com o "medidor" ligado (e sendo cobrada) enquanto o WebSocket
+// existir, mesmo que ninguem fale.
+const USER_SILENCE_TIMEOUT_MS = 5 * 60 * 1000;
+
+// RMS acima disso conta como "tem alguem falando" no chunk de ~256ms. Abaixo
+// disso e ruido de fundo (o getUserMedia ja pede noiseSuppression). Nao e
+// deteccao de fala robusta, so o suficiente pra distinguir sala em silencio
+// de alguem falando.
+const VOICE_ACTIVITY_RMS_THRESHOLD = 0.02;
+
+function hasVoiceActivity(samples: Float32Array): boolean {
+  let sumSquares = 0;
+  for (let i = 0; i < samples.length; i++) {
+    sumSquares += samples[i] * samples[i];
+  }
+  const rms = Math.sqrt(sumSquares / samples.length);
+  return rms > VOICE_ACTIVITY_RMS_THRESHOLD;
+}
+
 export function useAudioSession(missionId: string, token: string) {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [muted, setMuted] = useState(false);
   const [goAwayWarning, setGoAwayWarning] = useState<string | null>(null);
   const [noResponse, setNoResponse] = useState(false);
+  const [endedBySilence, setEndedBySilence] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const inputContextRef = useRef<AudioContext | null>(null);
@@ -99,6 +121,16 @@ export function useAudioSession(missionId: string, token: string) {
     setNoResponse(false);
   }
 
+  const userSilenceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function armUserSilenceWatchdog() {
+    if (userSilenceTimeoutRef.current) clearTimeout(userSilenceTimeoutRef.current);
+    userSilenceTimeoutRef.current = setTimeout(() => {
+      stop();
+      setEndedBySilence(true);
+    }, USER_SILENCE_TIMEOUT_MS);
+  }
+
   useEffect(() => {
     mutedRef.current = muted;
   }, [muted]);
@@ -123,12 +155,14 @@ export function useAudioSession(missionId: string, token: string) {
     isAiSpeakingRef.current = false;
     if (speakingWatchdogRef.current) clearTimeout(speakingWatchdogRef.current);
     if (noResponseTimeoutRef.current) clearTimeout(noResponseTimeoutRef.current);
+    if (userSilenceTimeoutRef.current) clearTimeout(userSilenceTimeoutRef.current);
     setNoResponse(false);
     setStatus("closed");
   }, []);
 
   const start = useCallback(async (resume = false) => {
     setStatus("connecting");
+    setEndedBySilence(false);
 
     // Ticket descartavel (30s, uso unico) em vez do JWT de sessao direto na
     // URL do WebSocket -- token de sessao nunca aparece em log de acesso.
@@ -154,6 +188,7 @@ export function useAudioSession(missionId: string, token: string) {
     ws.onopen = async () => {
       setStatus("open");
       armNoResponseWatchdog();
+      armUserSilenceWatchdog();
 
       // TODO: Defesa Nivel 1 (Mute Inteligente) ja fica pronta aqui de graca
       // -- o mutedRef.current dentro do onaudioprocess corta o envio de
@@ -180,8 +215,16 @@ export function useAudioSession(missionId: string, token: string) {
         processorRef.current = processor;
 
         processor.onaudioprocess = (event) => {
-          if (mutedRef.current || isAiSpeakingRef.current || ws.readyState !== WebSocket.OPEN) return;
           const input = event.inputBuffer.getChannelData(0);
+
+          // Roda independente de mute/vez-de-falar: e a sala fazendo barulho
+          // de verdade que prova que tem alguem ali, nao "chunk foi enviado"
+          // (que so aconteceria quando ja nao esta mutado nem e a vez da IA).
+          if (hasVoiceActivity(input)) {
+            armUserSilenceWatchdog();
+          }
+
+          if (mutedRef.current || isAiSpeakingRef.current || ws.readyState !== WebSocket.OPEN) return;
           const pcm = floatToInt16(input);
           ws.send(pcm.buffer as ArrayBuffer);
           // NAO rearma o watchdog aqui -- isso e chamado a cada ~250ms
@@ -302,5 +345,5 @@ export function useAudioSession(missionId: string, token: string) {
 
   useEffect(() => stop, [stop]);
 
-  return { status, muted, setMuted, start, stop, goAwayWarning, noResponse };
+  return { status, muted, setMuted, start, stop, goAwayWarning, noResponse, endedBySilence };
 }

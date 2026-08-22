@@ -11,7 +11,7 @@ interface SessionProps {
 
 export function Session({ mission, onEnd }: SessionProps) {
   const { token } = useAuth();
-  const { status, muted, setMuted, start, stop, goAwayWarning, noResponse } = useAudioSession(
+  const { status, muted, setMuted, start, stop, goAwayWarning, noResponse, endedBySilence } = useAudioSession(
     mission.id,
     token ?? "",
   );
@@ -42,7 +42,7 @@ export function Session({ mission, onEnd }: SessionProps) {
         {status === "connecting" && "Conectando..."}
         {status === "open" && (muted ? "Microfone mudo" : "Ouvindo...")}
         {status === "error" && "Erro: verifique a permissão do microfone ou a conexão"}
-        {status === "closed" && "Sessão encerrada"}
+        {status === "closed" && (endedBySilence ? "Sessão encerrada por inatividade" : "Sessão encerrada")}
       </p>
 
       {goAwayWarning && (
