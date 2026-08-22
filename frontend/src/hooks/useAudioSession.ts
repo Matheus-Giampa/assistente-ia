@@ -36,8 +36,9 @@ function int16ToFloat(input: Int16Array): Float32Array {
 }
 
 interface ControlMessage {
-  type: "interrupted" | "go_away" | "turn_complete";
+  type: "interrupted" | "go_away" | "turn_complete" | "session_handle";
   time_left?: string;
+  handle?: string;
 }
 
 // Quanto tempo sem NENHUMA resposta do Gemini (audio ou sinal de controle)
@@ -78,6 +79,12 @@ export function useAudioSession(missionId: string, token: string) {
   const streamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  // Handle de "session resumption" nativo do Gemini Live -- atualizado a
+  // cada "session_handle" que chega do backend. Preservado entre um stop()
+  // e o start(true) seguinte (reconnect do watchdog), pra sessao nova pedir
+  // pro Gemini restaurar o HISTORICO REAL da conversa em vez de comecar do
+  // zero. So zera num start(false) de verdade (conversa nova).
+  const sessionHandleRef = useRef<string | null>(null);
   const mutedRef = useRef(false);
   const playbackTimeRef = useRef(0);
   const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
@@ -170,6 +177,7 @@ export function useAudioSession(missionId: string, token: string) {
   const start = useCallback(async (resume = false) => {
     setStatus("connecting");
     setEndedBySilence(false);
+    if (!resume) sessionHandleRef.current = null;
 
     // Ticket descartavel (30s, uso unico) em vez do JWT de sessao direto na
     // URL do WebSocket -- token de sessao nunca aparece em log de acesso.
@@ -184,7 +192,10 @@ export function useAudioSession(missionId: string, token: string) {
     const apiUrl = import.meta.env.VITE_API_URL as string;
     const wsUrl = resolveWsUrl(apiUrl);
     const resumeParam = resume ? "&resume=true" : "";
-    const ws = new WebSocket(`${wsUrl}/ws/session/${missionId}?ticket=${ticket}${resumeParam}`);
+    const handleParam = sessionHandleRef.current
+      ? `&session_handle=${encodeURIComponent(sessionHandleRef.current)}`
+      : "";
+    const ws = new WebSocket(`${wsUrl}/ws/session/${missionId}?ticket=${ticket}${resumeParam}${handleParam}`);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
@@ -315,6 +326,10 @@ export function useAudioSession(missionId: string, token: string) {
 
         if (message.type === "go_away") {
           setGoAwayWarning(message.time_left ?? "em breve");
+        }
+
+        if (message.type === "session_handle" && message.handle) {
+          sessionHandleRef.current = message.handle;
         }
 
         return;

@@ -21,14 +21,30 @@ MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 _client = genai.Client(api_key=settings.gemini_api_key)
 
 
-RESUME_PROMPT = (
-    "A conversa caiu por um problema tecnico do lado do servidor. Retome de onde "
-    "estava, cumprimente brevemente o usuario avisando que voltou e pergunte se "
-    "pode continuar -- sem repetir tudo que ja foi dito antes."
+RESUME_PROMPT_WITH_CONTEXT = (
+    "A conexao caiu por um problema tecnico e acabou de ser restabelecida -- voce "
+    "ja tem o contexto de toda a conversa ate agora (session resumption do Gemini "
+    "Live). Avise brevemente que a conexao voltou e continue de onde parou, sem "
+    "recomecar do zero nem repetir o que ja foi dito."
+)
+
+# So usado quando o handle de resumption ainda nao existia (caiu logo no
+# comeco, antes do primeiro session_resumption_update chegar) -- nesse caso
+# a sessao nova E realmente sem contexto nenhum, entao nao da pra fingir que
+# lembra de algo.
+RESUME_PROMPT_NO_CONTEXT = (
+    "A conversa caiu por um problema tecnico logo no inicio, antes de conseguir "
+    "guardar o contexto -- essa sessao nao tem memoria da conversa anterior. "
+    "Cumprimente o usuario avisando que a conexao caiu e comece de novo."
 )
 
 
-async def run_audio_bridge(websocket: WebSocket, system_prompt: str, resume: bool = False) -> None:
+async def run_audio_bridge(
+    websocket: WebSocket,
+    system_prompt: str,
+    resume: bool = False,
+    resumption_handle: str | None = None,
+) -> None:
     """Abre a sessao com o Gemini Live e faz a ponte de audio nos dois
     sentidos ate qualquer um dos lados (cliente ou Gemini) encerrar.
 
@@ -45,19 +61,27 @@ async def run_audio_bridge(websocket: WebSocket, system_prompt: str, resume: boo
 
     resume=True quando o frontend reconectou sozinho apos detectar que a
     sessao anterior travou (Gemini parou de responder, mas a conexao TCP
-    nao caiu) -- ver "Recuperacao de Contexto (Cheap Prompting)" no
-    briefing original. Manda um prompt de texto barato pra reavivar a
-    conversa em vez de reprocessar todo audio antigo.
+    nao caiu). resumption_handle e o token de "session resumption" nativo
+    do Gemini Live (ver session_resumption_update abaixo) -- com ele a
+    sessao nova recebe o HISTORICO REAL da conversa (nao um resumo/prompt
+    fingindo lembrar), entao a IA de fato continua de onde parou em vez de
+    comecar do zero.
     """
     config = {
         "response_modalities": ["AUDIO"],
         "system_instruction": system_prompt,
+        # Sempre habilita o tracking de resumption, mesmo em sessao nova
+        # (handle=None) -- assim ja tem um handle pronto pra usar caso o
+        # watchdog do frontend precise reconectar mais tarde nessa mesma
+        # conversa.
+        "session_resumption": {"handle": resumption_handle},
     }
 
     async with _client.aio.live.connect(model=MODEL, config=config) as session:
         if resume:
+            prompt = RESUME_PROMPT_WITH_CONTEXT if resumption_handle else RESUME_PROMPT_NO_CONTEXT
             await session.send_client_content(
-                turns={"role": "user", "parts": [{"text": RESUME_PROMPT}]},
+                turns={"role": "user", "parts": [{"text": prompt}]},
                 turn_complete=True,
             )
 
@@ -83,6 +107,17 @@ async def run_audio_bridge(websocket: WebSocket, system_prompt: str, resume: boo
                             "type": "go_away",
                             "time_left": response.go_away.time_left,
                         }))
+
+                    if response.session_resumption_update:
+                        update = response.session_resumption_update
+                        # So repassa handle resumable -- um handle nao-resumable
+                        # (ex.: sessao ja invalidada) nao serve pra nada num
+                        # reconnect futuro.
+                        if update.resumable and update.new_handle:
+                            await websocket.send_text(json.dumps({
+                                "type": "session_handle",
+                                "handle": update.new_handle,
+                            }))
 
                     if not response.server_content:
                         continue
