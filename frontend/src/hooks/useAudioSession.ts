@@ -77,6 +77,7 @@ export function useAudioSession(missionId: string, token: string) {
   const outputContextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const mutedRef = useRef(false);
   const playbackTimeRef = useRef(0);
   const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
@@ -141,6 +142,12 @@ export function useAudioSession(missionId: string, token: string) {
 
     processorRef.current?.disconnect();
     processorRef.current = null;
+
+    if (workletNodeRef.current) {
+      workletNodeRef.current.port.onmessage = null;
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current = null;
+    }
 
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
@@ -207,16 +214,11 @@ export function useAudioSession(missionId: string, token: string) {
         inputContextRef.current = inputContext;
 
         const source = inputContext.createMediaStreamSource(stream);
-        // ScriptProcessorNode esta deprecated em favor de AudioWorklet, mas
-        // funciona em todo navegador atual e evita precisar servir um arquivo
-        // de worklet separado. TODO: migrar pra AudioWorklet quando sobrar
-        // tempo pra polir performance (roda fora da main thread).
-        const processor = inputContext.createScriptProcessor(4096, 1, 1);
-        processorRef.current = processor;
 
-        processor.onaudioprocess = (event) => {
-          const input = event.inputBuffer.getChannelData(0);
-
+        // Processa cada chunk de audio do microfone -- chamado tanto pelo
+        // AudioWorklet (caminho normal) quanto pelo fallback ScriptProcessorNode
+        // (se o worklet nao carregar), entao o comportamento e identico nos dois.
+        const handleAudioChunk = (input: Float32Array) => {
           // Roda independente de mute/vez-de-falar: e a sala fazendo barulho
           // de verdade que prova que tem alguem ali, nao "chunk foi enviado"
           // (que so aconteceria quando ja nao esta mutado nem e a vez da IA).
@@ -227,9 +229,9 @@ export function useAudioSession(missionId: string, token: string) {
           if (mutedRef.current || isAiSpeakingRef.current || ws.readyState !== WebSocket.OPEN) return;
           const pcm = floatToInt16(input);
           ws.send(pcm.buffer as ArrayBuffer);
-          // NAO rearma o watchdog aqui -- isso e chamado a cada ~250ms
-          // enquanto o usuario fala, e rearmar em todo chunk fazia o timer
-          // de 20s nunca completar enquanto a pessoa continuasse falando
+          // NAO rearma o watchdog de "travou" aqui -- isso e chamado a cada
+          // ~250ms enquanto o usuario fala, e rearmar em todo chunk fazia o
+          // timer de 20s nunca completar enquanto a pessoa continuasse falando
           // esperando resposta (bug real, achado com HAR: 112s de silencio
           // do Gemini e o watchdog nunca disparou). Agora so arma quando um
           // turno termina (ver "turn_complete"/"interrupted" abaixo) e no
@@ -237,8 +239,33 @@ export function useAudioSession(missionId: string, token: string) {
           // "tempo desde o ultimo audio enviado".
         };
 
-        source.connect(processor);
-        processor.connect(inputContext.destination);
+        // AudioWorklet roda em thread propria, dedicada, imune a engasgo da
+        // main thread -- ScriptProcessorNode (deprecated) roda na main thread
+        // junto com o React. Se o worklet nao carregar por qualquer motivo
+        // (navegador antigo, addModule falhar), cai pro ScriptProcessorNode
+        // de antes em vez de derrubar a sessao -- fala com a IA continua
+        // funcionando, so perde o isolamento de thread.
+        try {
+          await inputContext.audioWorklet.addModule("/mic-processor.worklet.js");
+          const workletNode = new AudioWorkletNode(inputContext, "mic-processor", {
+            processorOptions: { chunkSize: 4096 },
+          });
+          workletNodeRef.current = workletNode;
+          workletNode.port.onmessage = (event) => {
+            handleAudioChunk(event.data as Float32Array);
+          };
+          source.connect(workletNode);
+          workletNode.connect(inputContext.destination);
+        } catch (err) {
+          console.warn("AudioWorklet indisponivel, usando fallback ScriptProcessorNode:", err);
+          const processor = inputContext.createScriptProcessor(4096, 1, 1);
+          processorRef.current = processor;
+          processor.onaudioprocess = (event) => {
+            handleAudioChunk(event.inputBuffer.getChannelData(0));
+          };
+          source.connect(processor);
+          processor.connect(inputContext.destination);
+        }
       } catch {
         // Sem acesso ao microfone (permissao negada, sem dispositivo, etc)
         // a sessao nao serve pra nada -- encerra e mostra erro em vez de
