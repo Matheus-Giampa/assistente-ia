@@ -44,6 +44,7 @@ async def run_audio_bridge(
     system_prompt: str,
     resume: bool = False,
     resumption_handle: str | None = None,
+    silent: bool = False,
 ) -> None:
     """Abre a sessao com o Gemini Live e faz a ponte de audio nos dois
     sentidos ate qualquer um dos lados (cliente ou Gemini) encerrar.
@@ -61,11 +62,15 @@ async def run_audio_bridge(
 
     resume=True quando o frontend reconectou sozinho apos detectar que a
     sessao anterior travou (Gemini parou de responder, mas a conexao TCP
-    nao caiu). resumption_handle e o token de "session resumption" nativo
+    nao caiu) ou apos um go_away (Gemini avisando que vai derrubar a conexao
+    em breve). resumption_handle e o token de "session resumption" nativo
     do Gemini Live (ver session_resumption_update abaixo) -- com ele a
     sessao nova recebe o HISTORICO REAL da conversa (nao um resumo/prompt
     fingindo lembrar), entao a IA de fato continua de onde parou em vez de
-    comecar do zero.
+    comecar do zero. silent=True quando a troca foi proativa (go_away) --
+    da perspectiva do usuario nada quebrou, entao pula o prompt de "voltei"
+    (so faz sentido quando resume=True mas silent=False, ou seja, depois de
+    uma interrupcao que o usuario realmente percebeu).
     """
     config = {
         "response_modalities": ["AUDIO"],
@@ -78,7 +83,7 @@ async def run_audio_bridge(
     }
 
     async with _client.aio.live.connect(model=MODEL, config=config) as session:
-        if resume:
+        if resume and not silent:
             prompt = RESUME_PROMPT_WITH_CONTEXT if resumption_handle else RESUME_PROMPT_NO_CONTEXT
             await session.send_client_content(
                 turns={"role": "user", "parts": [{"text": prompt}]},
@@ -86,11 +91,30 @@ async def run_audio_bridge(
             )
 
         async def client_to_gemini() -> None:
+            # Alem de audio binario, o cliente manda controle em texto JSON
+            # (hoje so "mute") -- por isso usa receive() cru em vez de
+            # receive_bytes(), que so aceita frame binario.
             while True:
-                chunk = await websocket.receive_bytes()
-                await session.send_realtime_input(
-                    audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
-                )
+                message = await websocket.receive()
+                if message["type"] == "websocket.disconnect":
+                    raise WebSocketDisconnect(message.get("code", 1000))
+
+                if message.get("bytes") is not None:
+                    await session.send_realtime_input(
+                        audio=types.Blob(data=message["bytes"], mime_type="audio/pcm;rate=16000")
+                    )
+                elif message.get("text") is not None:
+                    try:
+                        control = json.loads(message["text"])
+                    except ValueError:
+                        continue
+                    if control.get("type") == "mute":
+                        # Usuario apertou "Mutar" -- trata como "terminei de
+                        # falar" e avisa o Gemini que o audio parou AGORA,
+                        # em vez de esperar o VAD dele perceber sozinho (que
+                        # as vezes demora e da a impressao de que a IA
+                        # travou ou nao ouviu direito).
+                        await session.send_realtime_input(audio_stream_end=True)
 
         async def gemini_to_client() -> None:
             # session.receive() e um generator POR TURNO -- ele termina

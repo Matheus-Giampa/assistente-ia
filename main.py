@@ -158,12 +158,19 @@ async def audio_session(websocket: WebSocket, mission_id: str) -> None:
         return
 
     resume = websocket.query_params.get("resume") == "true"
+    silent = websocket.query_params.get("silent") == "true"
     resumption_handle = websocket.query_params.get("session_handle")
 
     await websocket.accept()
 
     try:
-        await run_audio_bridge(websocket, system_prompt, resume=resume, resumption_handle=resumption_handle)
+        await run_audio_bridge(
+            websocket,
+            system_prompt,
+            resume=resume,
+            resumption_handle=resumption_handle,
+            silent=silent,
+        )
     except WebSocketDisconnect:
         pass
     finally:

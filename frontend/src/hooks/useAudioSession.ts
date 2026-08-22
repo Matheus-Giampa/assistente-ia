@@ -69,10 +69,21 @@ function hasVoiceActivity(samples: Float32Array): boolean {
 export function useAudioSession(missionId: string, token: string) {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [muted, setMuted] = useState(false);
-  const [goAwayWarning, setGoAwayWarning] = useState<string | null>(null);
   const [noResponse, setNoResponse] = useState(false);
   const [endedBySilence, setEndedBySilence] = useState(false);
+  // Espelha isAiSpeakingRef pra UI poder mostrar "IA falando..." -- o envio
+  // do mic ja fica pausado nesse intervalo (ver isAiSpeakingRef mais abaixo),
+  // isso e so o reflexo visual do que ja acontece de verdade.
+  const [aiSpeaking, setAiSpeaking] = useState(false);
 
+  // Cada start() incrementa e captura seu proprio numero. Se, quando o
+  // codigo assincrono (ticket, getUserMedia, WebSocket abrindo) finalmente
+  // resolver, o numero atual nao bater mais com o capturado, essa chamada
+  // foi substituida por outra (StrictMode do React monta o componente 2x em
+  // dev, ou um clique duplo em "Comecar") -- aborta em vez de deixar DUAS
+  // sessoes Gemini Live abertas ao mesmo tempo ouvindo o mesmo microfone e
+  // respondendo em paralelo (bug real: parecia a IA repetindo a fala).
+  const sessionEpochRef = useRef(0);
   const wsRef = useRef<WebSocket | null>(null);
   const inputContextRef = useRef<AudioContext | null>(null);
   const outputContextRef = useRef<AudioContext | null>(null);
@@ -102,6 +113,7 @@ export function useAudioSession(missionId: string, token: string) {
     if (speakingWatchdogRef.current) clearTimeout(speakingWatchdogRef.current);
     speakingWatchdogRef.current = setTimeout(() => {
       isAiSpeakingRef.current = false;
+      setAiSpeaking(false);
     }, 3000);
   }
 
@@ -114,7 +126,14 @@ export function useAudioSession(missionId: string, token: string) {
 
   // Indirecao pra chamar o reconnect() de dentro do watchdog sem depender
   // de ordem de declaracao (reconnect() usa start/stop, definidos abaixo).
-  const reconnectRef = useRef<() => void>(() => {});
+  // silent=true quando a troca e proativa (go_away, antes do Gemini derrubar
+  // de vez) -- nesse caso nao anuncia nada pro usuario nem pra IA, porque da
+  // perspectiva de quem esta conversando nada quebrou.
+  const reconnectRef = useRef<(silent?: boolean) => void>(() => {});
+  // Se o go_away chegar enquanto a IA esta no meio de uma fala, guarda a
+  // troca pendente e so executa no proximo turn_complete/interrupted --
+  // trocar no meio do audio cortaria a fala dela pela metade.
+  const pendingGoAwayRef = useRef(false);
 
   function armNoResponseWatchdog() {
     if (noResponseTimeoutRef.current) clearTimeout(noResponseTimeoutRef.current);
@@ -143,7 +162,26 @@ export function useAudioSession(missionId: string, token: string) {
     mutedRef.current = muted;
   }, [muted]);
 
+  const toggleMute = useCallback(() => {
+    setMuted((current) => {
+      const next = !current;
+      if (next && wsRef.current?.readyState === WebSocket.OPEN) {
+        // Usuario mutou de proposito -- trata como "terminei de falar" e
+        // avisa o backend, que manda audio_stream_end pro Gemini processar
+        // o turno agora em vez de esperar o VAD dele perceber sozinho (as
+        // vezes demora e da a impressao de que a IA nao respondeu).
+        wsRef.current.send(JSON.stringify({ type: "mute" }));
+      }
+      return next;
+    });
+  }, []);
+
   const stop = useCallback(() => {
+    // Invalida qualquer start() ainda em andamento (esperando ticket,
+    // permissao de mic, etc.) -- sem isso, um stop() no meio de um start()
+    // lento nao impede a sessao de "ressuscitar" quando o await resolver.
+    sessionEpochRef.current += 1;
+
     wsRef.current?.close();
     wsRef.current = null;
 
@@ -167,6 +205,7 @@ export function useAudioSession(missionId: string, token: string) {
 
     activeSourcesRef.current = [];
     isAiSpeakingRef.current = false;
+    setAiSpeaking(false);
     if (speakingWatchdogRef.current) clearTimeout(speakingWatchdogRef.current);
     if (noResponseTimeoutRef.current) clearTimeout(noResponseTimeoutRef.current);
     if (userSilenceTimeoutRef.current) clearTimeout(userSilenceTimeoutRef.current);
@@ -174,7 +213,13 @@ export function useAudioSession(missionId: string, token: string) {
     setStatus("closed");
   }, []);
 
-  const start = useCallback(async (resume = false) => {
+  const start = useCallback(async (resume = false, silent = false) => {
+    // Marca essa chamada como a "atual" -- qualquer start() ou stop()
+    // seguinte muda sessionEpochRef.current e faz essa chamada se
+    // reconhecer como obsoleta nos pontos de checagem abaixo.
+    const myEpoch = ++sessionEpochRef.current;
+    const isStale = () => sessionEpochRef.current !== myEpoch;
+
     setStatus("connecting");
     setEndedBySilence(false);
     if (!resume) sessionHandleRef.current = null;
@@ -189,13 +234,18 @@ export function useAudioSession(missionId: string, token: string) {
       return;
     }
 
+    if (isStale()) return;
+
     const apiUrl = import.meta.env.VITE_API_URL as string;
     const wsUrl = resolveWsUrl(apiUrl);
     const resumeParam = resume ? "&resume=true" : "";
+    const silentParam = silent ? "&silent=true" : "";
     const handleParam = sessionHandleRef.current
       ? `&session_handle=${encodeURIComponent(sessionHandleRef.current)}`
       : "";
-    const ws = new WebSocket(`${wsUrl}/ws/session/${missionId}?ticket=${ticket}${resumeParam}${handleParam}`);
+    const ws = new WebSocket(
+      `${wsUrl}/ws/session/${missionId}?ticket=${ticket}${resumeParam}${silentParam}${handleParam}`,
+    );
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
@@ -204,6 +254,15 @@ export function useAudioSession(missionId: string, token: string) {
     playbackTimeRef.current = outputContext.currentTime;
 
     ws.onopen = async () => {
+      if (isStale()) {
+        // Essa chamada de start() ja foi substituida por outra (StrictMode
+        // do React remontando em dev, ou um segundo start() disparado antes
+        // desse abrir) -- fecha essa conexao orfa em vez de deixar 2
+        // sessoes Gemini Live ativas ao mesmo tempo ouvindo o mesmo mic.
+        ws.close();
+        return;
+      }
+
       setStatus("open");
       armNoResponseWatchdog();
       armUserSilenceWatchdog();
@@ -219,6 +278,16 @@ export function useAudioSession(missionId: string, token: string) {
             autoGainControl: true,
           },
         });
+
+        if (isStale()) {
+          // Idem, mas depois de ja ter pego o microfone -- solta os tracks
+          // na hora, senao o mic fica com o LED aceso preso por uma sessao
+          // fantasma que ninguem mais referencia.
+          stream.getTracks().forEach((track) => track.stop());
+          ws.close();
+          return;
+        }
+
         streamRef.current = stream;
 
         const inputContext = new AudioContext({ sampleRate: INPUT_SAMPLE_RATE });
@@ -312,7 +381,13 @@ export function useAudioSession(missionId: string, token: string) {
           activeSourcesRef.current = [];
           playbackTimeRef.current = context.currentTime;
           isAiSpeakingRef.current = false;
+          setAiSpeaking(false);
           if (speakingWatchdogRef.current) clearTimeout(speakingWatchdogRef.current);
+          if (pendingGoAwayRef.current) {
+            pendingGoAwayRef.current = false;
+            reconnectRef.current(true);
+            return;
+          }
           armNoResponseWatchdog();
         }
 
@@ -320,12 +395,29 @@ export function useAudioSession(missionId: string, token: string) {
           // A vez do Gemini acabou -- libera o microfone de novo e comeca a
           // contar os 20s de espera pela PROXIMA resposta.
           isAiSpeakingRef.current = false;
+          setAiSpeaking(false);
           if (speakingWatchdogRef.current) clearTimeout(speakingWatchdogRef.current);
+          if (pendingGoAwayRef.current) {
+            // Go_away chegou enquanto ela falava -- so agora, com o turno
+            // fechado, e seguro trocar de sessao sem cortar audio no meio.
+            pendingGoAwayRef.current = false;
+            reconnectRef.current(true);
+            return;
+          }
           armNoResponseWatchdog();
         }
 
         if (message.type === "go_away") {
-          setGoAwayWarning(message.time_left ?? "em breve");
+          // Troca de sessao PROATIVA antes do Gemini derrubar de vez, usando
+          // o handle de resumption -- olhando de fora, o usuario nunca
+          // percebe o corte (nem aviso na tela, nem a IA comentando que
+          // "voltou"). So adia se ela estiver no meio de uma fala (ver
+          // pendingGoAwayRef acima).
+          if (isAiSpeakingRef.current) {
+            pendingGoAwayRef.current = true;
+          } else {
+            reconnectRef.current(true);
+          }
         }
 
         if (message.type === "session_handle" && message.handle) {
@@ -340,6 +432,7 @@ export function useAudioSession(missionId: string, token: string) {
       // Chegou audio novo do Gemini -- ele esta com a vez de falar, entao
       // pausa o envio do microfone ate o turn_complete.
       isAiSpeakingRef.current = true;
+      setAiSpeaking(true);
       armSpeakingWatchdog();
 
       const float32 = int16ToFloat(new Int16Array(event.data));
@@ -372,14 +465,19 @@ export function useAudioSession(missionId: string, token: string) {
     };
   }, [missionId, token]);
 
-  // Reconexao automatica quando o watchdog de "travou" estoura: fecha a
-  // sessao morta e abre uma nova com resume=true, que injeta o prompt
-  // barato de retomada em vez de reprocessar o audio todo (Cheap Prompting
-  // do briefing original).
-  const reconnect = useCallback(() => {
-    stop();
-    void start(true);
-  }, [stop, start]);
+  // Reconexao automatica: fecha a sessao antiga e abre uma nova com
+  // resume=true (usa o handle de resumption pra restaurar o contexto real).
+  // silent=true (go_away proativo) pula o prompt de "voltei" -- nada
+  // quebrou da perspectiva do usuario, entao nao ha o que anunciar.
+  // silent=false (watchdog de "travou") manda o prompt, porque ai sim
+  // houve uma interrupcao real que vale a IA reconhecer.
+  const reconnect = useCallback(
+    (silent = false) => {
+      stop();
+      void start(true, silent);
+    },
+    [stop, start],
+  );
 
   useEffect(() => {
     reconnectRef.current = reconnect;
@@ -387,5 +485,14 @@ export function useAudioSession(missionId: string, token: string) {
 
   useEffect(() => stop, [stop]);
 
-  return { status, muted, setMuted, start, stop, goAwayWarning, noResponse, endedBySilence };
+  return {
+    status,
+    muted,
+    toggleMute,
+    start,
+    stop,
+    noResponse,
+    endedBySilence,
+    aiSpeaking,
+  };
 }
